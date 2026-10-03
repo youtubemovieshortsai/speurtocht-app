@@ -1,0 +1,826 @@
+"use client";
+
+import dynamic from "next/dynamic";
+const GameMap = dynamic(() => import("./GameMap"), { ssr: false });
+import { Suspense, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { createClient } from "../../lib/supabase";
+
+type Player = {
+  id: string;
+  display_name: string;
+  role: string;
+  location_sharing: boolean;
+  is_found: boolean;
+  seeker_seconds: number;
+};
+
+type GameEvent = {
+  id: string;
+  type: string;
+  actor_player_id: string;
+  actor_name: string | null;
+  target_player_id: string;
+  target_name: string | null;
+  created_at: string;
+};
+
+type Assignment = {
+  id: string;
+  minute: number;
+  task: string;
+  is_due: boolean;
+};
+
+type RankingPlayer = {
+  player_id: string;
+  display_name: string;
+  seeker_seconds: number;
+};
+
+type GameState = {
+  game: {
+    id: string;
+    name: string;
+    game_code: string;
+    status: string;
+    scheduled_date: string;
+    duration_minutes: number;
+    run_away_seconds: number;
+    start_time: string | null;
+    end_time: string | null;
+    current_seeker_id: string | null;
+    server_now: string;
+  };
+  players: Player[];
+  locations: unknown[];
+  events: GameEvent[];
+  ranking: RankingPlayer[];
+  assignments: Assignment[];
+  my_player_id: string;
+};
+
+function formatTime(totalSeconds: number) {
+  const safeSeconds = Math.max(0, Math.floor(totalSeconds));
+
+  const hours = Math.floor(safeSeconds / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  const seconds = safeSeconds % 60;
+
+  return [
+    hours.toString().padStart(2, "0"),
+    minutes.toString().padStart(2, "0"),
+    seconds.toString().padStart(2, "0"),
+  ].join(":");
+}
+
+function formatSeekerTime(totalSeconds: number) {
+  const safeSeconds = Math.max(0, Math.floor(totalSeconds));
+
+  if (safeSeconds < 60) {
+    return `${safeSeconds} sec`;
+  }
+
+  const minutes = Math.floor(safeSeconds / 60);
+  const seconds = safeSeconds % 60;
+
+  if (minutes < 60) {
+    return `${minutes} min ${seconds} sec`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+
+  return `${hours} uur ${remainingMinutes} min`;
+}
+
+function GameRoom() {
+  const searchParams = useSearchParams();
+  const supabase = createClient();
+
+  const gameId = searchParams.get("game");
+  const code = searchParams.get("code") || "";
+
+  const [state, setState] = useState<GameState | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [starting, setStarting] = useState(false);
+  const [tagging, setTagging] = useState<string | null>(null);
+  const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
+  const [runAwayLeft, setRunAwayLeft] = useState<number | null>(null);
+  const [finishing, setFinishing] = useState(false);
+  const [dismissedAssignmentIds, setDismissedAssignmentIds] = useState<string[]>([]);
+
+  const me = state?.players.find((p) => p.id === state.my_player_id);
+  const [gpsLoading, setGpsLoading] = useState(false);
+  const [gpsError, setGpsError] = useState("");
+  const gpsWatchIdRef = useRef<number | null>(null);
+  const gpsSessionRef = useRef<string | null>(null);
+  const gpsActiveRef = useRef(false);
+
+  async function loadGame() {
+    if (!gameId) {
+      setError("Geen spel gevonden.");
+      setLoading(false);
+      return;
+    }
+
+    const saved = sessionStorage.getItem(
+      `bankzitters-player-${gameId}`
+    );
+
+    if (!saved) {
+      setError("Je spelerssessie is niet gevonden.");
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const credentials = JSON.parse(saved);
+
+      const { data, error: rpcError } = await supabase.rpc(
+        "get_game_state",
+        {
+          p_game_id: gameId,
+          p_player_id: credentials.playerId,
+          p_access_token: credentials.accessToken,
+        }
+      );
+
+      if (rpcError) {
+        setError(rpcError.message);
+        setLoading(false);
+        return;
+      }
+
+      setState(data);
+      setLoading(false);
+    } catch {
+      setError("Je spelerssessie is ongeldig.");
+      setLoading(false);
+    }
+  }
+
+  function dismissAssignment(assignmentId: string) {
+    setDismissedAssignmentIds((current) =>
+      current.includes(assignmentId)
+        ? current
+        : [...current, assignmentId]
+    );
+  }
+
+  async function finishGameIfNeeded() {
+    if (!gameId || finishing) return;
+
+    setFinishing(true);
+
+    await supabase.rpc(
+      "finish_game_if_expired",
+      {
+        p_game_id: gameId,
+      }
+    );
+
+    await loadGame();
+
+    setFinishing(false);
+  }
+
+  async function startGame() {
+    if (!gameId || !state) return;
+
+    const saved = sessionStorage.getItem(
+      `bankzitters-player-${gameId}`
+    );
+
+    if (!saved) return;
+
+    const credentials = JSON.parse(saved);
+
+    setStarting(true);
+    setError("");
+
+    const { error: rpcError } = await supabase.rpc(
+      "start_game",
+      {
+        p_game_id: gameId,
+        p_player_id: credentials.playerId,
+        p_access_token: credentials.accessToken,
+      }
+    );
+
+    setStarting(false);
+
+    if (rpcError) {
+      setError(rpcError.message);
+      return;
+    }
+
+    await loadGame();
+  }
+
+  async function tagPlayer(targetPlayer: Player) {
+    if (!gameId || !state) return;
+
+    const confirmed = window.confirm(
+      `Heb je ${targetPlayer.display_name} echt getikt?\n\n` +
+      `Na bevestiging wordt ${targetPlayer.display_name} de nieuwe tikker.`
+    );
+
+    if (!confirmed) return;
+
+    const saved = sessionStorage.getItem(
+      `bankzitters-player-${gameId}`
+    );
+
+    if (!saved) return;
+
+    const credentials = JSON.parse(saved);
+
+    setTagging(targetPlayer.id);
+    setError("");
+
+    const { error: rpcError } = await supabase.rpc(
+      "tag_player",
+      {
+        p_seeker_id: credentials.playerId,
+        p_seeker_token: credentials.accessToken,
+        p_target_player_id: targetPlayer.id,
+      }
+    );
+
+    setTagging(null);
+
+    if (rpcError) {
+      setError(rpcError.message);
+      return;
+    }
+
+    await loadGame();
+  }
+  useEffect(() => {
+    loadGame();
+
+    const interval = setInterval(loadGame, 2000);
+
+    return () => clearInterval(interval);
+  }, [gameId]);
+
+  useEffect(() => {
+    if (
+      !state?.game.start_time ||
+      !state?.game.server_now ||
+      state.game.status !== "starting"
+    ) {
+      setRunAwayLeft(null);
+      return;
+    }
+
+    const start = new Date(state.game.start_time).getTime();
+    const serverNowAtLoad = new Date(state.game.server_now).getTime();
+    const localNowAtLoad = Date.now();
+
+    function updateRunAwayTimer() {
+      const elapsed = Date.now() - localNowAtLoad;
+      const currentServerTime = serverNowAtLoad + elapsed;
+
+      const remaining = Math.max(
+        0,
+        Math.ceil((start - currentServerTime) / 1000)
+      );
+
+      setRunAwayLeft(remaining);
+    }
+
+    updateRunAwayTimer();
+
+    const timer = setInterval(updateRunAwayTimer, 250);
+
+    return () => clearInterval(timer);
+  }, [
+    state?.game.start_time,
+    state?.game.server_now,
+    state?.game.status,
+  ]);
+  useEffect(() => {
+    if (
+      !state?.game.end_time ||
+      !state?.game.server_now ||
+      state.game.status !== "active"
+    ) {
+      setSecondsLeft(null);
+      return;
+    }
+
+    const game = state.game;
+    const end = new Date(game.end_time!).getTime();
+    const serverNowAtLoad = new Date(game.server_now).getTime();
+    const localNowAtLoad = Date.now();
+
+    function updateTimer() {
+      const elapsed = Date.now() - localNowAtLoad;
+      const currentServerTime = serverNowAtLoad + elapsed;
+
+      const remaining = Math.min(
+        game.duration_minutes * 60,
+        Math.max(
+          0,
+          Math.ceil((end - currentServerTime) / 1000)
+        )
+      );
+
+      setSecondsLeft(remaining);
+
+      if (remaining <= 0) {
+        finishGameIfNeeded();
+      }
+    }
+
+    updateTimer();
+
+    const timer = setInterval(updateTimer, 250);
+
+    return () => clearInterval(timer);
+  }, [
+    state?.game.end_time,
+    state?.game.server_now,
+    state?.game.status,
+  ]);
+  useEffect(() => {
+    if (!state?.game.id || !state.my_player_id) return;
+
+    const shouldTrack =
+      state.game.status === "starting" ||
+      state.game.status === "active";
+
+    if (!shouldTrack) {
+      gpsActiveRef.current = false;
+
+      if (
+        gpsWatchIdRef.current !== null &&
+        navigator.geolocation
+      ) {
+        navigator.geolocation.clearWatch(gpsWatchIdRef.current);
+        gpsWatchIdRef.current = null;
+      }
+
+      gpsSessionRef.current = null;
+      return;
+    }
+
+    if (!navigator.geolocation) {
+      setGpsError("Deze telefoon/browser ondersteunt geen GPS.");
+      return;
+    }
+
+    const sessionKey = `${state.game.id}:${state.my_player_id}`;
+
+    if (gpsSessionRef.current === sessionKey) {
+      gpsActiveRef.current = true;
+      return;
+    }
+
+    const saved = sessionStorage.getItem(
+      `bankzitters-player-${state.game.id}`
+    );
+
+    if (!saved) return;
+
+    const credentials = JSON.parse(saved);
+    const gpsOptions: PositionOptions = {
+      enableHighAccuracy: true,
+      maximumAge: 0,
+      timeout: 15000,
+    };
+
+    gpsActiveRef.current = true;
+    gpsSessionRef.current = sessionKey;
+
+    const sendLocation = async (
+      position: GeolocationPosition
+    ) => {
+      if (!gpsActiveRef.current) return;
+
+      const { error } = await supabase.rpc(
+        "update_location",
+        {
+          p_game_id: state.game.id,
+          p_player_id: credentials.playerId,
+          p_access_token: credentials.accessToken,
+          p_latitude: position.coords.latitude,
+          p_longitude: position.coords.longitude,
+          p_accuracy: position.coords.accuracy,
+        }
+      );
+
+      if (error) {
+        setGpsError(error.message);
+      } else {
+        setGpsError("");
+      }
+    };
+
+    const startLiveWatch = () => {
+      if (
+        !gpsActiveRef.current ||
+        gpsWatchIdRef.current !== null
+      ) {
+        return;
+      }
+
+      gpsWatchIdRef.current =
+        navigator.geolocation.watchPosition(
+          sendLocation,
+          () =>
+            setGpsError(
+              "GPS kon niet worden opgehaald. Controleer je locatie-toestemming."
+            ),
+          gpsOptions
+        );
+    };
+
+    navigator.geolocation.getCurrentPosition(
+      async (position) => {
+        if (!gpsActiveRef.current) return;
+
+        const { error } = await supabase.rpc(
+          "set_location_sharing",
+          {
+            p_game_id: state.game.id,
+            p_player_id: credentials.playerId,
+            p_access_token: credentials.accessToken,
+            p_enabled: true,
+          }
+        );
+
+        if (error) {
+          gpsActiveRef.current = false;
+          gpsSessionRef.current = null;
+          setGpsError(error.message);
+          return;
+        }
+
+        setGpsError("");
+        await sendLocation(position);
+        startLiveWatch();
+      },
+      () => {
+        gpsActiveRef.current = false;
+        gpsSessionRef.current = null;
+        setGpsError(
+          "GPS-toestemming is nodig om mee te spelen."
+        );
+      },
+      gpsOptions
+    );
+  }, [
+    state?.game.id,
+    state?.game.status,
+    state?.my_player_id,
+  ]);
+  if (loading) {
+    return (
+      <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center">
+        Laden...
+      </main>
+    );
+  }
+
+  if (error && !state) {
+    return (
+      <main className="min-h-screen w-full max-w-md mx-auto bg-slate-950 text-white p-4 overflow-x-hidden overflow-y-auto">
+        <div className="mx-auto max-w-md">
+          <div className="rounded-2xl border border-red-500/40 bg-red-500/10 p-5 text-red-300">
+            {error}
+          </div>
+        </div>
+      </main>
+    );
+  }
+
+  if (!state) return null;
+
+
+  const seeker = state.players.find(
+    (player) => player.id === state.game.current_seeker_id
+  );
+
+  const isOrganizer = me?.role === "organizer";
+  const isSeeker = me?.id === state.game.current_seeker_id;
+
+  const latestTag = state.events.find(
+    (event) => event.type === "tag"
+  );
+
+  const dueAssignments = (state.assignments ?? []).filter((assignment) => assignment.is_due && !dismissedAssignmentIds.includes(assignment.id));
+
+  return (
+    <main className="min-h-screen w-full max-w-md mx-auto bg-slate-950 text-white p-4 overflow-x-hidden overflow-y-auto">
+      <div className="mx-auto max-w-md">
+
+        <p className="text-sm text-slate-400 mb-2">
+          BANKZITTERS THE GAME
+        </p>
+
+        <h1 className="text-3xl font-bold mb-2">
+          {state.game.name}
+        </h1>
+
+        <p className="text-slate-400 mb-6">
+          Spelcode:{" "}
+          <span className="text-white font-bold tracking-widest">
+            {code}
+          </span>
+        </p>
+
+        {error && (
+          <div className="rounded-xl border border-red-500/40 bg-red-500/10 p-4 text-red-300 mb-6">
+            {error}
+          </div>
+        )}
+
+        {state.game.status === "waiting" && (
+          <>
+            <div className="rounded-2xl bg-slate-900 border border-slate-800 p-6 mb-6 text-center">
+              <p className="text-sm uppercase tracking-wider text-slate-400 mb-2">
+                Wachten op de start
+              </p>
+              <div className="text-5xl mb-4">👥</div>
+              <h2 className="text-2xl font-black mb-2">
+                {state.players.length} spelers
+              </h2>
+              <p className="text-slate-400">
+                Deel de spelcode met iedereen die mee wil doen.
+              </p>
+            </div>
+
+            {isOrganizer && (
+              <button
+                type="button"
+                onClick={startGame}
+                disabled={starting}
+                className="w-full rounded-xl bg-green-500 px-5 py-4 font-bold text-slate-950 disabled:opacity-50 mb-6"
+              >
+                {starting ? "Spel starten..." : "🚀 Spel starten"}
+              </button>
+            )}
+
+            {!isOrganizer && (
+              <div className="rounded-xl bg-slate-900 border border-slate-800 p-4 text-center text-slate-400 mb-6">
+                De organisator moet het spel starten.
+              </div>
+            )}
+          </>
+        )}
+
+        {state.game.status === "starting" && (
+          <div className="rounded-2xl bg-slate-900 border border-slate-800 p-8 mb-6 text-center">
+            <p className="text-sm uppercase tracking-wider text-slate-400 mb-3">
+              Het spel begint over
+            </p>
+            <div className="text-7xl font-black mb-4">
+              {runAwayLeft ?? 0}
+            </div>
+            <p className="text-slate-400">Maak je klaar!</p>
+          </div>
+        )}
+
+        {state.game.status === "active" && (
+          <>
+            <div className="rounded-2xl bg-slate-900 border border-slate-800 p-6 mb-6 text-center">
+              <p className="text-sm uppercase tracking-wider text-slate-400 mb-2">
+                Resterende speeltijd
+              </p>
+
+              <div className="text-5xl font-black tracking-wider">
+                {formatTime(secondsLeft ?? 0)}
+              </div>
+
+              {isSeeker ? (
+                <p className="text-blue-400 font-bold mt-3">
+                  🎯 Jij bent de tikker
+                </p>
+              ) : (
+                <p className="text-green-400 font-bold mt-3">
+                  🎯 {seeker?.display_name ?? "De tikker"} is de tikker
+                </p>
+              )}
+            </div>
+
+            {isSeeker && (
+              <div className="rounded-2xl bg-slate-900 border border-slate-800 p-6 mb-6">
+                <div className="space-y-3">
+                  {state.players
+                    .filter((player) => player.id !== state.my_player_id)
+                    .map((player) => (
+                      <button
+                        key={player.id}
+                        type="button"
+                        onClick={() => tagPlayer(player)}
+                        disabled={tagging !== null}
+                        className="w-full flex items-center justify-between rounded-xl bg-slate-800 px-4 py-4 text-left disabled:opacity-50"
+                      >
+                        <span className="font-bold">
+                          {player.display_name}
+                        </span>
+                        <span className="text-blue-400 font-bold">
+                          {tagging === player.id ? "..." : "TIK"}
+                        </span>
+                      </button>
+                    ))}
+                </div>
+              </div>
+            )}
+
+            {isSeeker && (
+              <div className="w-full bg-slate-950 border-t border-slate-800 pt-4 mt-6">
+                <h2 className="text-xl font-bold mb-3">Speler tikken</h2>
+                <div className="h-[32vh] min-h-[230px] max-h-[320px] overflow-hidden rounded-2xl">
+                  <GameMap
+                    locations={state.locations as {
+                      player_id: string;
+                      latitude: number;
+                      longitude: number;
+                      accuracy: number | null;
+                    }[]}
+                    players={state.players}
+                  />
+                </div>
+              </div>
+            )}
+
+            {!isSeeker && dueAssignments.length > 0 && (
+              <div className="space-y-4 mb-6">
+                {dueAssignments.map((assignment) => (
+                  <div
+                    key={assignment.id}
+                    className="relative rounded-2xl border border-yellow-400/50 bg-yellow-400/10 p-5 pr-14 shadow-lg"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => dismissAssignment(assignment.id)}
+                      aria-label="Opdracht sluiten"
+                      className="absolute right-3 top-3 flex h-9 w-9 items-center justify-center rounded-full bg-slate-900/80 text-xl text-slate-300 hover:text-white"
+                    >
+                      ✕
+                    </button>
+
+                    <p className="text-sm font-bold uppercase tracking-wider text-yellow-300 mb-2">
+                      🎯 Nieuwe opdracht!
+                    </p>
+
+                    <p className="text-lg font-bold leading-relaxed text-white">
+                      {assignment.task}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {gpsError && (
+              <div className="rounded-xl border border-yellow-500/40 bg-yellow-500/10 p-4 text-yellow-300 mb-6">
+                {gpsError}
+              </div>
+            )}
+          </>
+        )}
+
+        
+
+        {state.game.status === "finished" && (
+          <>
+            <div className="rounded-2xl bg-green-500/10 border border-green-500/40 p-6 mb-6 text-center">
+              <div className="text-5xl mb-4">🏁</div>
+              <h2 className="text-3xl font-black mb-2">
+                Spel afgelopen!
+              </h2>
+              <p className="text-slate-300">
+                De volledige speeltijd is verstreken.
+              </p>
+            </div>
+
+            <div className="rounded-2xl bg-slate-900 border border-slate-800 p-6 mb-6">
+              <div className="text-center mb-6">
+                <p className="text-sm uppercase tracking-wider text-slate-400">
+                  Eindranglijst
+                </p>
+                <h2 className="text-2xl font-black mt-1">
+                  Minste → meeste tijd als tikker
+                </h2>
+                <p className="text-sm text-slate-500 mt-2">
+                  De speler met de minste totale tikkertijd staat bovenaan.
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                {state.ranking.map((player, index) => (
+                  <div
+                    key={player.player_id}
+                    className="flex items-center gap-3 rounded-xl bg-slate-800 px-4 py-4"
+                  >
+                    <div className="w-9 h-9 rounded-full bg-slate-700 flex items-center justify-center font-black">
+                      {index + 1}
+                    </div>
+                    <div className="flex-1">
+                      <p className="font-bold">{player.display_name}</p>
+                      <p className="text-sm text-slate-400">
+                        {formatSeekerTime(player.seeker_seconds)} als tikker
+                      </p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </>
+        )}</div>
+    </main>
+  );
+  }
+
+export default function GamePage() {
+  return (
+    <Suspense
+      fallback={
+        <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center">
+          Laden...
+        </main>
+      }
+    >
+      <GameRoom />
+    </Suspense>
+  );
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,110 @@
+"use client";
+
+import { MapContainer, TileLayer, Marker, Popup } from "react-leaflet";
+import dynamic from "next/dynamic";
+import { useState } from "react";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
+
+type MapLocation = {
+  player_id: string;
+  latitude: number;
+  longitude: number;
+  accuracy: number | null;
+};
+
+type MapPlayer = {
+  id: string;
+  display_name: string;
+};
+
+type GameMapProps = {
+  locations: MapLocation[];
+  players: MapPlayer[];
+};
+
+const playerIcon = new L.Icon({
+  iconUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png",
+  iconRetinaUrl:
+    "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png",
+  shadowUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
+  iconSize: [25, 41],
+  iconAnchor: [12, 41],
+  popupAnchor: [1, -34],
+  shadowSize: [41, 41],
+});
+
+function GameMap({ locations, players }: GameMapProps) {
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const visibleLocations = locations.filter(
+    (location) =>
+      Number.isFinite(location.latitude) &&
+      Number.isFinite(location.longitude)
+  );
+
+  if (visibleLocations.length === 0) {
+    return (
+      <div className="rounded-2xl border border-slate-800 p-6 text-center text-slate-400">
+        Nog geen exacte GPS-locatie ontvangen.
+      </div>
+    );
+  }
+
+  const center: [number, number] = [
+    visibleLocations[0].latitude,
+    visibleLocations[0].longitude,
+  ];
+
+  return (
+    <div className={`${isFullscreen ? "fixed inset-0 z-[9999] h-[100dvh] w-full rounded-none border-0" : "relative h-full rounded-2xl border border-slate-800"} overflow-hidden bg-slate-950`}>
+      <button
+        type="button"
+        onClick={() => setIsFullscreen((current) => !current)}
+        className="absolute right-3 top-3 z-[1000] rounded-lg bg-slate-950/90 px-3 py-2 text-lg text-white shadow-lg backdrop-blur"
+        aria-label={isFullscreen ? "Kaart verkleinen" : "Kaart fullscreen maken"}
+      >
+        {isFullscreen ? "KLEIN" : "FULL"}
+      </button>
+      <MapContainer
+        center={center}
+        zoom={16}
+        scrollWheelZoom
+        style={{ height: "100%", width: "100%" }}
+      >
+        <TileLayer
+          attribution='&copy; OpenStreetMap contributors'
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        />
+
+        {visibleLocations.map((location) => {
+          const player = players.find(
+            (item) => item.id === location.player_id
+          );
+
+          return (
+            <Marker
+              key={location.player_id}
+              position={[location.latitude, location.longitude]}
+              icon={playerIcon}
+            >
+              <Popup>
+                <strong>{player?.display_name ?? "Speler"}</strong>
+                {location.accuracy !== null && (
+                  <div>Nauwkeurigheid: ±{Math.round(location.accuracy)} m</div>
+                )}
+              </Popup>
+            </Marker>
+          );
+        })}
+      </MapContainer>
+    </div>
+  );
+}
+
+export default dynamic(() => Promise.resolve(GameMap), {
+  ssr: false,
+});
+
+
+
+
